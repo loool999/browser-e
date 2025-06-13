@@ -9,6 +9,6 @@ sudo ./guacamole.sh
 ```
 or 
 ```bash
-chmod +x ./rv.sh #idk why i named it this
-sudo ./rv.sh
+chmod +x ./starting.sh #idk why i named it this
+sudo ./starting.sh
 ```
