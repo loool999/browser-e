@@ -93,7 +93,12 @@ install_dependencies() {
   apt-get update
 
   print_info "Installing base dependencies (audio, VNC, etc.)..."
-  DEPS=(tigervnc-standalone-server tigervnc-common openbox wget ca-certificates gnupg jq xterm pulseaudio pavucontrol)
+  # =========================================================================
+  #   FIX #2: Add 'tigervnc-tools' package.
+  #   Newer Ubuntu versions (22.04+) split the `vncpasswd` command into this
+  #   separate package. This ensures it's available.
+  # =========================================================================
+  DEPS=(tigervnc-standalone-server tigervnc-common tigervnc-tools openbox wget ca-certificates gnupg jq xterm pulseaudio pavucontrol)
   apt-get install -y --no-install-recommends "${DEPS[@]}"
 
   # Check if Docker is installed. If not, install it.
@@ -152,8 +157,6 @@ install_dependencies() {
   fi
 }
 
-# ... (keep the rest of your script the same) ...
-
 configure_system() {
   print_info "Configuring VNC, Audio, and Guacamole for $TARGET_USER..."
   local vnc_pass_file="$TARGET_HOME/.vnc/passwd"
@@ -164,10 +167,20 @@ configure_system() {
     VNC_PASSWORD=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 12)
     print_info "Generated VNC Password: $VNC_PASSWORD"
   fi
-  VNC_PASS_CMD=$(command -v vncpasswd || echo "/usr/bin/vncpasswd")
+
+  # =========================================================================
+  #   FIX #2: Make vncpasswd command detection robust.
+  #   This properly finds the command and exits with an error if it's missing,
+  #   preventing the "command not found" error from sudo.
+  # =========================================================================
+  VNC_PASS_CMD=$(command -v vncpasswd)
+  if [ -z "$VNC_PASS_CMD" ]; then
+      print_error "vncpasswd command not found. Please ensure 'tigervnc-tools' is installed."
+      exit 1
+  fi
   echo "$VNC_PASSWORD" | sudo -u "$TARGET_USER" "$VNC_PASS_CMD" -f > "$vnc_pass_file"
 
-  ### FIX 1: Ensure the user owns their VNC password file for robust permissions.
+  # Ensure correct ownership and permissions for the VNC password file
   chown "$TARGET_USER:$TARGET_USER" "$vnc_pass_file"
   chmod 600 "$vnc_pass_file"
 
@@ -197,7 +210,11 @@ EOF"
   print_info "Creating Guacamole configuration..."
   mkdir -p "${GUAC_CONFIG_DIR}"
 
-  # Create guacamole.properties file
+  # =========================================================================
+  #   FIX #1: Correct the guacamole.properties configuration.
+  #   Since the guacamole containers run on the host network, they connect
+  #   to guacd (the VNC proxy) via localhost (127.0.0.1).
+  # =========================================================================
   cat > "${GUAC_CONFIG_DIR}/guacamole.properties" <<EOF
 # Guacamole configuration
 guacd-hostname: 127.0.0.1
@@ -206,9 +223,11 @@ guacd-port: 4822
 basic-user-mapping: /etc/guacamole/user-mapping.xml
 EOF
 
-  # Create user-mapping.xml file
-  ### FIX 2: Changed host.docker.internal to 127.0.0.1 for both VNC and audio.
-  ### This is the correct address since the containers are running on the host network.
+  # =========================================================================
+  #   FIX #1: Correct the user-mapping.xml configuration.
+  #   Changed host.docker.internal to 127.0.0.1 for both VNC and audio.
+  #   This is the correct address because the containers are on the host network.
+  # =========================================================================
   cat > "${GUAC_CONFIG_DIR}/user-mapping.xml" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <user-mapping>
@@ -234,7 +253,6 @@ EOF
 
   print_success "System configured for $TARGET_USER."
 }
-
 
 # Function to check if port is available
 check_port() {
@@ -275,7 +293,7 @@ test_vnc_connection() {
   print_info "Testing VNC connection..."
   
   # Check if VNC server is running
-  if pgrep -f "Xtigervnc.*:1" > /dev/null; then
+  if pgrep -f "Xtigervnc.*${VNC_DISPLAY}" > /dev/null; then
     print_success "VNC server is running"
   else
     print_error "VNC server is not running"
@@ -369,12 +387,7 @@ start_services() {
   docker run -d --rm \
     --name guacamole \
     --network host \
-    --add-host host.docker.internal:host-gateway \
-    -p "0.0.0.0:${WEB_PORT}:8080" \
     -v "${GUAC_CONFIG_DIR}:/etc/guacamole:ro" \
-    -e "GUACAMOLE_HOME=/etc/guacamole" \
-    -e "GUACD_HOSTNAME=127.0.0.1" \
-    -e "GUACD_PORT=4822" \
     guacamole/guacamole
 
   # Wait for Guacamole
@@ -403,8 +416,6 @@ start_services() {
   docker logs --follow guacamole &
   wait
 }
-
-
 
 # --- Main Flow ---
 # Ensure cleanup runs on script exit (e.g., CTRL+C)
