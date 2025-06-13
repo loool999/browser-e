@@ -36,8 +36,8 @@ CHROME_FLAGS="--no-sandbox \
               --user-data-dir=${TMP_CHROME_PROFILE}"
 
 # Guacamole Configuration
-GUAC_USER=${GUAC_USER:-guacadmin}
-GUAC_PASS=${GUAC_PASS:-guacadmin} # WARNING: Change this for production environments!
+GUAC_USER=${GUAC_USER:-123}
+GUAC_PASS=${GUAC_PASS:-123} # WARNING: Change this for production environments!
 GUAC_CONFIG_DIR="/etc/guacamole"
 
 print_info()  { echo -e "\e[34m[INFO]\e[0m    $1"; }
@@ -93,7 +93,7 @@ install_dependencies() {
   apt-get update
 
   print_info "Installing base dependencies (audio, VNC, etc.)..."
-  DEPS=(tigervnc-standalone-server openbox wget ca-certificates gnupg jq xterm pulseaudio pavucontrol)
+  DEPS=(tigervnc-standalone-server tigervnc-common openbox wget ca-certificates gnupg jq xterm pulseaudio pavucontrol)
   apt-get install -y --no-install-recommends "${DEPS[@]}"
 
   # Check if Docker is installed. If not, install it.
@@ -162,7 +162,9 @@ configure_system() {
     VNC_PASSWORD=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 12)
     print_info "Generated VNC Password: $VNC_PASSWORD"
   fi
-  echo "$VNC_PASSWORD" | sudo -u "$TARGET_USER" vncpasswd -f > "$vnc_pass_file"
+  VNC_PASS_CMD=$(command -v vncpasswd || echo "/usr/bin/vncpasswd")
+  echo "$VNC_PASSWORD" | sudo -u "$TARGET_USER" "$VNC_PASS_CMD" -f > "$vnc_pass_file"
+
   chmod 600 "$vnc_pass_file"
 
   # --- Create Xstartup for VNC session ---
