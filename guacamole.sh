@@ -152,6 +152,8 @@ install_dependencies() {
   fi
 }
 
+# ... (keep the rest of your script the same) ...
+
 configure_system() {
   print_info "Configuring VNC, Audio, and Guacamole for $TARGET_USER..."
   local vnc_pass_file="$TARGET_HOME/.vnc/passwd"
@@ -165,15 +167,11 @@ configure_system() {
   VNC_PASS_CMD=$(command -v vncpasswd || echo "/usr/bin/vncpasswd")
   echo "$VNC_PASSWORD" | sudo -u "$TARGET_USER" "$VNC_PASS_CMD" -f > "$vnc_pass_file"
 
+  ### FIX 1: Ensure the user owns their VNC password file for robust permissions.
+  chown "$TARGET_USER:$TARGET_USER" "$vnc_pass_file"
   chmod 600 "$vnc_pass_file"
 
   # --- Create Xstartup for VNC session ---
-  # =========================================================================
-  #   FIX: Add PULSE_SERVER environment variable.
-  #   This tells applications inside VNC where to send their audio output.
-  #   From the VNC session's perspective (running on the host), the
-  #   PulseAudio server is on localhost at the specified port.
-  # =========================================================================
   sudo -u "$TARGET_USER" bash -c "cat > '$TARGET_HOME/.vnc/xstartup' <<EOF
 #!/bin/bash
 export PULSE_SERVER=127.0.0.1:${PULSE_PORT}
@@ -186,12 +184,9 @@ xterm &
 google-chrome-stable \${CHROME_FLAGS} &
 exec openbox
 EOF"
-  # Note: We need to escape ${CHROME_FLAGS} so it's interpreted when the
-  #       script runs, not when the heredoc is created.
   sudo -u "$TARGET_USER" chmod +x "$TARGET_HOME/.vnc/xstartup"
 
   # --- Configure PulseAudio to accept network connections ---
-  # Allow connections from Docker's network bridge as well as localhost.
   sudo -u "$TARGET_USER" mkdir -p "$TARGET_HOME/.config/pulse"
   sudo -u "$TARGET_USER" bash -c "cat > '$TARGET_HOME/.config/pulse/default.pa' <<'EOF'
 .include /etc/pulse/default.pa
@@ -205,24 +200,26 @@ EOF"
   # Create guacamole.properties file
   cat > "${GUAC_CONFIG_DIR}/guacamole.properties" <<EOF
 # Guacamole configuration
-guacd-hostname: guacd
+guacd-hostname: 127.0.0.1
 guacd-port: 4822
 # Basic file authentication
 basic-user-mapping: /etc/guacamole/user-mapping.xml
 EOF
 
   # Create user-mapping.xml file
+  ### FIX 2: Changed host.docker.internal to 127.0.0.1 for both VNC and audio.
+  ### This is the correct address since the containers are running on the host network.
   cat > "${GUAC_CONFIG_DIR}/user-mapping.xml" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <user-mapping>
     <authorize username="${GUAC_USER}" password="${GUAC_PASS}">
         <connection name="Chrome VNC Desktop">
             <protocol>vnc</protocol>
-            <param name="hostname">host.docker.internal</param>
+            <param name="hostname">127.0.0.1</param>
             <param name="port">${VNC_PORT}</param>
             <param name="password">${VNC_PASSWORD}</param>
             <param name="enable-audio">true</param>
-            <param name="audio-servername">host.docker.internal:${PULSE_PORT}</param>
+            <param name="audio-servername">127.0.0.1:${PULSE_PORT}</param>
         </connection>
     </authorize>
 </user-mapping>
@@ -237,6 +234,7 @@ EOF
 
   print_success "System configured for $TARGET_USER."
 }
+
 
 # Function to check if port is available
 check_port() {
@@ -331,107 +329,82 @@ wait_for_service() {
   return 1
 }
 
-# --- Start everything, stream logs, then wait for CTRL+C ---
 start_services() {
   # Debug configuration
   debug_config
 
-  # Check if port is available
+  # Check if web port is available
   if ! check_port "$WEB_PORT"; then
     print_error "Cannot start service - port $WEB_PORT is in use"
     exit 1
   fi
 
+  # Start PulseAudio
   print_info "Starting PulseAudio for $TARGET_USER…"
-  # The configuration is now handled entirely by the ~/.config/pulse/default.pa file
   sudo -u "$TARGET_USER" pulseaudio --start --log-target=syslog
 
+  # Start VNC server
   print_info "Starting VNC server (display $VNC_DISPLAY) as $TARGET_USER…"
-  # Explicitly set the security type to basic VNC authentication to match
-  # what the default Guacamole client expects. This disables TLS.
-  # The "-localhost no" flag makes it listen on all network interfaces (0.0.0.0),
-  # which is crucial for the Docker container to be able to reach it.
   sudo -u "$TARGET_USER" vncserver "$VNC_DISPLAY" \
     -geometry "$VNC_GEOMETRY" -depth "$VNC_DEPTH" -localhost no \
     -SecurityTypes VncAuth
-
-  # Test VNC connection
   sleep 2
   test_vnc_connection
 
-  print_info "Ensuring Docker network 'guacnet' exists…"
-  docker network inspect guacnet &>/dev/null || \
-    docker network create guacnet
+  # Stop any old Guacamole containers
+  print_info "Stopping any existing guacd/guacamole containers…"
+  docker rm -f guacd guacamole >/dev/null 2>&1 || true
 
-  print_info "Pulling Guacamole images…"
+  # Launch guacd on host network
+  print_info "Pulling + launching guacd on host network…"
   docker pull guacamole/guacd
-  docker pull guacamole/guacamole
-
-  print_info "Launching guacd daemon…"
-  # =========================================================================
-  #   FIX: Add --add-host here so guacd knows how to find the VNC server
-  #   on the host machine.
-  # =========================================================================
-  docker run -d --rm --name guacd \
-    --network guacnet \
-    --add-host=host.docker.internal:host-gateway \
+  docker run -d --rm \
+    --name guacd \
+    --network host \
     guacamole/guacd
 
-  # Wait for guacd to be ready
-  sleep 3
-
-  print_info "Launching Guacamole web interface..."
-  # =========================================================================
-  #   FIX: The --add-host flag is not needed here, it was moved to guacd.
-  # =========================================================================
-  docker run -d --rm --name guacamole \
-    --network guacnet \
+  # Launch web interface on host network
+  print_info "Pulling + launching Guacamole web interface on host network…"
+  docker pull guacamole/guacamole
+  docker run -d --rm \
+    --name guacamole \
+    --network host \
+    --add-host host.docker.internal:host-gateway \
     -p "0.0.0.0:${WEB_PORT}:8080" \
     -v "${GUAC_CONFIG_DIR}:/etc/guacamole:ro" \
     -e "GUACAMOLE_HOME=/etc/guacamole" \
-    -e "GUACD_HOSTNAME=guacd" \
+    -e "GUACD_HOSTNAME=127.0.0.1" \
     -e "GUACD_PORT=4822" \
     guacamole/guacamole
 
-  # Wait for Guacamole to be ready
+  # Wait for Guacamole
   if ! wait_for_service "localhost" "$WEB_PORT" "Guacamole"; then
     print_error "Guacamole failed to start properly"
     docker logs guacamole
     exit 1
   fi
 
+  # Print access info
   SERVER_IP=$(hostname -I | awk '{print $1}')
-
   print_success "Remote Desktop READY!"
   echo
   echo "  Access URL: http://${SERVER_IP}:${WEB_PORT}/guacamole/"
   echo "  Local URL:  http://localhost:${WEB_PORT}/guacamole/"
   echo
   echo "=== LOGIN CREDENTIALS ==="
-  echo "  Guacamole Web Interface:"
-  echo "    Username: ${GUAC_USER}"
-  echo "    Password: ${GUAC_PASS}"
-  echo
-  echo "  VNC Server (internal use only):"
-  echo "    VNC Password: ${VNC_PASSWORD}"
+  echo "  Web Interface:   ${GUAC_USER}/${GUAC_PASS}"
+  echo "  VNC Password:    ${VNC_PASSWORD}"
   echo "========================="
   echo
 
-  print_info "Services listening on port ${WEB_PORT}:"
-  netstat -tuln | grep ":${WEB_PORT} " || echo "No services found listening on port ${WEB_PORT}"
-
-  print_warn "If you're in Codespaces, make sure port ${WEB_PORT} is forwarded/exposed."
-  print_info "If you can't access the service, check your firewall settings."
-  echo
-
+  # Stream logs until Ctrl+C
   print_info "Streaming container logs (CTRL+C to stop & cleanup)…"
-  echo "── guacd ─────────────────────────────────────────"
   docker logs --follow guacd &
-  echo "── guacamole ────────────────────────────────────"
   docker logs --follow guacamole &
-
   wait
 }
+
+
 
 # --- Main Flow ---
 # Ensure cleanup runs on script exit (e.g., CTRL+C)
